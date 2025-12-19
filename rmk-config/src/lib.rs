@@ -754,6 +754,9 @@ pub struct Pmw3610Config {
     /// Enable smart mode for better tracking on shiny surfaces
     #[serde(default)]
     pub smart_mode: bool,
+    /// Maximum report rate in Hz (default: 100Hz). This limits how often mouse reports
+    /// are sent to prevent flooding the HID report channel.
+    pub max_report_hz: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

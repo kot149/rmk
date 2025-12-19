@@ -143,8 +143,14 @@ pub(crate) fn expand_pmw3610_device(
         });
 
         // Generate processor initialization
-        let processor_init = quote! {
-            let mut #processor_ident = ::rmk::input_device::pmw3610::Pmw3610Processor::new(&keymap);
+        let processor_init = if let Some(max_report_hz) = sensor.max_report_hz {
+            quote! {
+                let mut #processor_ident = ::rmk::input_device::pmw3610::Pmw3610Processor::with_report_hz(&keymap, #max_report_hz);
+            }
+        } else {
+            quote! {
+                let mut #processor_ident = ::rmk::input_device::pmw3610::Pmw3610Processor::new(&keymap);
+            }
         };
 
         processor_initializers.push(Initializer {

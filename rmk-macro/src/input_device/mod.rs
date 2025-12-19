@@ -16,13 +16,14 @@ pub(crate) struct Initializer {
 }
 
 /// Expands the input device configuration.
-/// Returns a tuple containing: (device_and_processors_initialization, devices, processors)
+/// Returns a tuple containing: (device_and_processors_initialization, devices, processors, polling_controllers)
 pub(crate) fn expand_input_device_config(
     keyboard_config: &KeyboardTomlConfig,
-) -> (TokenStream, Vec<TokenStream>, Vec<TokenStream>) {
+) -> (TokenStream, Vec<TokenStream>, Vec<TokenStream>, Vec<TokenStream>) {
     let mut initialization = TokenStream::new();
     let mut devices = Vec::new();
     let mut processors = Vec::new();
+    let mut polling_controllers = Vec::new();
 
     // generate ADC configuration
     let communication = keyboard_config.get_communication_config().unwrap();
@@ -118,7 +119,7 @@ pub(crate) fn expand_input_device_config(
     for initializer in pmw3610_processor_initializers {
         initialization.extend(initializer.initializer);
         let processor_name = initializer.var_name;
-        processors.push(quote! { #processor_name });
+        polling_controllers.push(quote! { #processor_name.polling_loop() });
     }
 
     // For split keyboards, also generate processors for PMW3610 devices on peripherals
@@ -138,10 +139,10 @@ pub(crate) fn expand_input_device_config(
             for initializer in peripheral_pmw3610_processors {
                 initialization.extend(initializer.initializer);
                 let processor_name = initializer.var_name;
-                processors.push(quote! { #processor_name });
+                polling_controllers.push(quote! { #processor_name.polling_loop() });
             }
         }
     }
 
-    (initialization, devices, processors)
+    (initialization, devices, processors, polling_controllers)
 }

@@ -64,7 +64,10 @@ pub(crate) fn rmk_entry_select(
         }
     };
     let event_trait_import = if !controllers.is_empty() {
-        quote! { use ::rmk::controller::EventController; }
+        quote! {
+            use ::rmk::controller::EventController;
+            use ::rmk::controller::PollingController;
+        }
     } else {
         quote! {}
     };

@@ -10,11 +10,12 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal_async::spi::SpiBus;
 use usbd_hid::descriptor::MouseReport;
 
-use crate::channel::KEYBOARD_REPORT_CHANNEL;
+use crate::channel::{EVENT_CHANNEL, KEYBOARD_REPORT_CHANNEL};
+use crate::controller::{Controller, PollingController};
 pub use crate::driver::bitbang_spi::{BitBangError, BitBangSpiBus};
 use crate::event::{Axis, AxisEvent, AxisValType, Event};
 use crate::hid::Report;
-use crate::input_device::{InputDevice, InputProcessor, ProcessResult};
+use crate::input_device::InputDevice;
 use crate::keymap::KeyMap;
 
 // ============================================================================
@@ -573,21 +574,58 @@ where
     }
 }
 
-/// PMW3610 Processor that converts motion events to mouse reports
+/// PMW3610 Processor that converts motion events to mouse reports.
+///
+/// Uses the `PollingController` pattern to accumulate motion events and send
+/// mouse reports at a configurable frequency. This prevents flooding the HID
+/// report channel with too many reports, which can cause latency issues
+/// especially over BLE.
+///
+/// # Usage
+/// ```rust
+/// let processor = Pmw3610Processor::new(&keymap);
+/// // or with custom report rate:
+/// let processor = Pmw3610Processor::with_report_hz(&keymap, 60);
+/// processor.polling_loop().await;
+/// ```
 pub struct Pmw3610Processor<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize> {
     /// Reference to the keymap
+    #[allow(dead_code)]
     keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>,
+    /// Accumulated X movement since last report
+    accumulated_x: i32,
+    /// Accumulated Y movement since last report
+    accumulated_y: i32,
+    /// Report interval
+    report_interval: Duration,
 }
 
 impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize>
     Pmw3610Processor<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>
 {
-    /// Create a new PMW3610 processor with default settings
+    /// Default report rate in Hz
+    const DEFAULT_REPORT_HZ: u64 = 100;
+
+    /// Create a new PMW3610 processor with default report rate (100Hz).
     pub fn new(keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>) -> Self {
-        Self { keymap }
+        Self::with_report_hz(keymap, Self::DEFAULT_REPORT_HZ as u32)
     }
 
-    async fn generate_report(&self, x: i16, y: i16) {
+    /// Create a new PMW3610 processor with a custom report rate in Hz.
+    ///
+    /// # Arguments
+    /// * `keymap` - Reference to the keymap
+    /// * `report_hz` - Maximum report rate in Hz
+    pub fn with_report_hz(keymap: &'a RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>>, report_hz: u32) -> Self {
+        Self {
+            keymap,
+            accumulated_x: 0,
+            accumulated_y: 0,
+            report_interval: Duration::from_hz(report_hz as u64),
+        }
+    }
+
+    async fn send_mouse_report(&self, x: i16, y: i16) {
         let mouse_report = MouseReport {
             buttons: 0,
             x: x.clamp(i8::MIN as i16, i8::MAX as i16) as i8,
@@ -595,39 +633,46 @@ impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_E
             wheel: 0,
             pan: 0,
         };
-        self.send_report(Report::MouseReport(mouse_report)).await;
+        KEYBOARD_REPORT_CHANNEL.send(Report::MouseReport(mouse_report)).await;
     }
 }
 
-impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize>
-    InputProcessor<'a, ROW, COL, NUM_LAYER, NUM_ENCODER> for Pmw3610Processor<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>
+impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize> Controller
+    for Pmw3610Processor<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>
 {
-    async fn process(&mut self, event: Event) -> ProcessResult {
-        match event {
-            Event::Joystick(axis_events) => {
-                let mut x = 0i16;
-                let mut y = 0i16;
+    type Event = Event;
 
-                for axis_event in axis_events.iter() {
-                    match axis_event.axis {
-                        Axis::X => x = axis_event.value,
-                        Axis::Y => y = axis_event.value,
-                        _ => {}
-                    }
+    async fn process_event(&mut self, event: Self::Event) {
+        if let Event::Joystick(axis_events) = event {
+            for axis_event in axis_events.iter() {
+                match axis_event.axis {
+                    Axis::X => self.accumulated_x += axis_event.value as i32,
+                    Axis::Y => self.accumulated_y += axis_event.value as i32,
+                    _ => {}
                 }
-
-                self.generate_report(x, y).await;
-                ProcessResult::Stop
             }
-            _ => ProcessResult::Continue(event),
         }
     }
 
-    async fn send_report(&self, report: Report) {
-        KEYBOARD_REPORT_CHANNEL.send(report).await;
+    async fn next_message(&mut self) -> Self::Event {
+        EVENT_CHANNEL.receive().await
+    }
+}
+
+impl<'a, const ROW: usize, const COL: usize, const NUM_LAYER: usize, const NUM_ENCODER: usize> PollingController
+    for Pmw3610Processor<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>
+{
+    fn interval(&self) -> Duration {
+        self.report_interval
     }
 
-    fn get_keymap(&self) -> &RefCell<KeyMap<'a, ROW, COL, NUM_LAYER, NUM_ENCODER>> {
-        self.keymap
+    async fn update(&mut self) {
+        if self.accumulated_x != 0 || self.accumulated_y != 0 {
+            let x = self.accumulated_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            let y = self.accumulated_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            self.accumulated_x = 0;
+            self.accumulated_y = 0;
+            self.send_mouse_report(x, y).await;
+        }
     }
 }
