@@ -19,7 +19,8 @@ pub(crate) fn active_transport() -> Option<ConnectionType> {
     CONNECTION_STATUS.lock(|c| c.get().decide_active())
 }
 
-pub(crate) fn current_connection_status() -> ConnectionStatus {
+/// Return the current connection status snapshot.
+pub fn current_connection_status() -> ConnectionStatus {
     CONNECTION_STATUS.lock(|c| c.get())
 }
 
@@ -40,8 +41,9 @@ pub(crate) fn current_sleep_state() -> bool {
     }
 }
 
+/// Return the current BLE status snapshot.
 #[cfg(feature = "_ble")]
-pub(crate) fn current_ble_status() -> BleStatus {
+pub fn current_ble_status() -> BleStatus {
     CONNECTION_STATUS.lock(|c| c.get().ble)
 }
 
@@ -85,11 +87,16 @@ pub(crate) fn set_ble_state(s: BleState) {
 
 /// Switching profiles always drops the BLE state back to `Inactive`; the
 /// connection loop re-advertises and updates state from there.
-pub(crate) fn set_ble_profile(profile: u8) {
+pub(crate) fn set_ble_profile(profile: u8, bonded: bool) {
     update_status(|c| {
         c.ble.profile = profile;
         c.ble.state = BleState::Inactive;
+        c.ble.bonded = bonded;
     });
+}
+
+pub(crate) fn set_active_ble_profile_bonded(bonded: bool) {
+    update_status(|c| c.ble.bonded = bonded);
 }
 
 /// Persistence is the caller's responsibility — enqueue
@@ -149,6 +156,8 @@ mod tests {
     use super::{
         CONNECTION_STATUS, ConnectionStatus, ConnectionType, UsbState, set_preferred_connection, set_usb_state,
     };
+    #[cfg(feature = "_ble")]
+    use super::{set_active_ble_profile_bonded, set_ble_profile};
     use crate::event::{ConnectionStatusChangeEvent, EventSubscriber, SubscribableEvent};
     use crate::hid::{KeyboardReport, Report};
     use crate::test_support::test_block_on as block_on;
@@ -226,6 +235,39 @@ mod tests {
             Either::First(_) => {}
             Either::Second(event) => panic!("unexpected status change event: {:?}", event),
         }
+    }
+
+    #[cfg(feature = "_ble")]
+    #[test]
+    fn ble_profile_update_publishes_profile_state_and_bond_together() {
+        use rmk_types::ble::{BleState, BleStatus};
+
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        let mut sub = ConnectionStatusChangeEvent::subscriber();
+
+        set_ble_profile(1, true);
+
+        assert_eq!(
+            block_on(sub.next_event()).0.ble,
+            BleStatus {
+                profile: 1,
+                state: BleState::Inactive,
+                bonded: true,
+            }
+        );
+    }
+
+    #[cfg(feature = "_ble")]
+    #[test]
+    fn active_ble_profile_bond_update_publishes_status_event() {
+        let _guard = state_test_lock().lock().unwrap();
+        reset_state();
+        let mut sub = ConnectionStatusChangeEvent::subscriber();
+
+        set_active_ble_profile_bonded(true);
+
+        assert!(block_on(sub.next_event()).0.ble.bonded);
     }
 
     #[cfg(not(feature = "_no_usb"))]
