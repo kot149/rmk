@@ -50,7 +50,7 @@ RMK provides built-in event types organized by category. All of them are exporte
 
 **Connection Events**:
 
-- `ConnectionStatusChangeEvent` - Full `ConnectionStatus` snapshot (USB lifecycle, BLE profile/state, preferred transport); fires on every transition
+- `ConnectionStatusChangeEvent` - Full `ConnectionStatus` snapshot (USB lifecycle, BLE profile/state/bond, preferred transport); fires on every transition. It is not a retained state, so consumers that need the initial state should subscribe first, then call `rmk::state::current_connection_status()` for the current snapshot.
 
 **Split Keyboard Events** (when split is enabled):
 
