@@ -185,9 +185,6 @@ impl<P: PacketPool> Runnable for BleBatteryServer<'_, '_, '_, P> {
         let mut battery_status = self.sub.next_message_pure().await;
         loop {
             wait_until_battery_report_allowed(&mut self.last_activity_timestamp, next_timeout).await;
-            if SLEEPING_STATE.load(Ordering::Acquire) {
-                continue;
-            }
 
             // Check if there's a newer event, if not, use original battery status event
             let state = self.sub.try_next_message_pure().unwrap_or(battery_status);
@@ -240,6 +237,7 @@ async fn wait_until_battery_report_allowed<M: embassy_sync::blocking_mutex::raw:
 pub(crate) struct BlePeripheralBatteryServer<'stack, 'server, 'conn, P: PacketPool> {
     battery_levels: [Characteristic<u8>; crate::SPLIT_BATTERY_PERIPHERALS_NUM],
     conn: &'conn GattConnection<'stack, 'server, P>,
+    last_activity_timestamp: WatchReceiver<'static, crate::RawMutex, u32, 2>,
     sub: Subscriber<
         'static,
         crate::RawMutex,
@@ -255,6 +253,23 @@ fn find_peripheral_battery_slot(configured_ids: &[usize], peripheral_id: usize) 
     configured_ids
         .iter()
         .position(|configured_id| *configured_id == peripheral_id)
+}
+
+#[cfg(feature = "split")]
+fn mark_pending_peripheral_batteries(
+    pending_slots: &mut [bool],
+    configured_ids: &[usize],
+    result: embassy_sync::pubsub::WaitResult<PeripheralBatteryEvent>,
+) {
+    match result {
+        embassy_sync::pubsub::WaitResult::Message(event) => {
+            if let Some(slot) = find_peripheral_battery_slot(configured_ids, event.id) {
+                pending_slots[slot] = true;
+            }
+        }
+        // Dropped events may belong to any peripheral; refresh every cached level.
+        embassy_sync::pubsub::WaitResult::Lagged(_) => pending_slots.fill(true),
+    }
 }
 
 #[cfg(feature = "split")]
@@ -281,6 +296,9 @@ impl<'stack, 'server, 'conn, P: PacketPool> BlePeripheralBatteryServer<'stack, '
         Self {
             battery_levels: server.peripheral_battery_services.levels,
             conn,
+            last_activity_timestamp: LAST_ACTIVITY_TIMESTAMP
+                .receiver()
+                .expect("battery activity timestamp receiver limit reached"),
             sub,
         }
     }
@@ -307,14 +325,45 @@ impl<P: PacketPool> Runnable for BlePeripheralBatteryServer<'_, '_, '_, P> {
             }
         }
 
+        let mut pending_slots = [false; crate::SPLIT_BATTERY_PERIPHERALS_NUM];
+        let mut next_timeout = Instant::now() + Duration::from_secs(1800);
         loop {
-            let event = self.sub.next_message_pure().await;
-            if let Some(slot) = find_peripheral_battery_slot(&crate::SPLIT_BATTERY_PERIPHERAL_IDS, event.id)
-                && let BatteryStatus::Available { level: Some(level), .. } = event.state.0
-                && let Err(e) = self.battery_levels[slot].notify(self.conn, &level, true).await
-            {
-                error!("Failed to notify peripheral {} battery level: {:?}", event.id, e);
+            if !pending_slots.iter().any(|pending| *pending) {
+                mark_pending_peripheral_batteries(
+                    &mut pending_slots,
+                    &crate::SPLIT_BATTERY_PERIPHERAL_IDS,
+                    self.sub.next_message().await,
+                );
+                if !pending_slots.iter().any(|pending| *pending) {
+                    continue;
+                }
             }
+
+            wait_until_battery_report_allowed(&mut self.last_activity_timestamp, next_timeout).await;
+
+            while let Some(result) = self.sub.try_next_message() {
+                mark_pending_peripheral_batteries(&mut pending_slots, &crate::SPLIT_BATTERY_PERIPHERAL_IDS, result);
+            }
+
+            for (slot, peripheral_id) in crate::SPLIT_BATTERY_PERIPHERAL_IDS.iter().copied().enumerate() {
+                if !pending_slots[slot] {
+                    continue;
+                }
+                if SLEEPING_STATE.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Some(BatteryStatus::Available { level: Some(level), .. }) =
+                    crate::split::driver::current_peripheral_battery_status(peripheral_id)
+                    && let Err(e) = self.battery_levels[slot].notify(self.conn, &level, true).await
+                {
+                    error!("Failed to notify peripheral {} battery level: {:?}", peripheral_id, e);
+                }
+                pending_slots[slot] = false;
+            }
+            if pending_slots.iter().any(|pending| *pending) {
+                continue;
+            }
+            next_timeout = Instant::now() + Duration::from_secs(1800);
         }
     }
 }
@@ -466,6 +515,10 @@ mod tests {
         assert_eq!(find_peripheral_battery_slot(&configured_ids, 0), Some(0));
         assert_eq!(find_peripheral_battery_slot(&configured_ids, 1), None);
         assert_eq!(find_peripheral_battery_slot(&configured_ids, 2), Some(1));
+
+        let mut pending_slots = [false; 2];
+        pending_slots[find_peripheral_battery_slot(&configured_ids, 2).unwrap()] = true;
+        assert_eq!(pending_slots, [false, true]);
     }
 
     #[test]
@@ -479,6 +532,31 @@ mod tests {
             assert_eq!(first.changed().await, 42);
             assert_eq!(second.changed().await, 42);
         });
+    }
+
+    #[test]
+    fn peripheral_queue_overflow_refreshes_all_slots() {
+        use embassy_sync::pubsub::PubSubChannel;
+
+        use crate::event::{BatteryStatusEvent, PeripheralBatteryEvent};
+
+        let channel = PubSubChannel::<NoopRawMutex, PeripheralBatteryEvent, 2, 1, 1>::new();
+        let mut subscriber = channel.subscriber().unwrap();
+        let publisher = channel.immediate_publisher();
+        let mut pending_slots = [true, false];
+        for id in [2, 0, 0] {
+            publisher.publish_immediate(PeripheralBatteryEvent {
+                id,
+                state: BatteryStatusEvent(rmk_types::battery::BatteryStatus::Available {
+                    charge_state: rmk_types::battery::ChargeState::Discharging,
+                    level: Some(74),
+                }),
+            });
+        }
+        while let Some(result) = subscriber.try_next_message() {
+            super::mark_pending_peripheral_batteries(&mut pending_slots, &[0, 2], result);
+        }
+        assert_eq!(pending_slots, [true, true]);
     }
 
     #[test]
